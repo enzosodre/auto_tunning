@@ -5,6 +5,9 @@ import sys
 from multiprocessing import Pool, cpu_count, Manager
 import os
 import copy
+import json
+from datetime import datetime
+
 
 # =============================================================================
 # ### CONFIGURAÇÃO PRINCIPAL (HARD-CODED) ###
@@ -14,6 +17,9 @@ EXECUTABLE_PATH = "./modelo10.exe"
 
 # Tempo limite total em minutos
 TIME_LIMIT_MINUTES = 50
+
+REPORT_PATH = "resultado_pattern_search.json"
+
 
 # Número de processos paralelos (Multi-Start)
 WORKER_COUNT = 8
@@ -220,6 +226,34 @@ def run_pattern_search(start_individual, param_definitions, end_time, objective_
 # =============================================================================
 # ### FUNÇÃO PRINCIPAL (ORQUESTRADOR) - ATUALIZADA ###
 # =============================================================================
+
+def save_report(
+    start_time,
+    end_time,
+    objective_multiplier,
+    best_value,
+    best_individual,
+    algorithm_name="Multi-Start Pattern Search"
+):
+    """Salva um relatório JSON com os principais resultados da execução."""
+    report = {
+        "inicio": datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S"),
+        "fim": datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S"),
+        "duracao_segundos": end_time - start_time,
+        "objetivo": "max" if objective_multiplier == 1.0 else "min",
+        "algoritmo": algorithm_name,
+        "melhor_valor": best_value,
+        "melhores_parametros": best_individual,
+    }
+
+    try:
+        with open(REPORT_PATH, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=4)
+        print(f"\nRelatório salvo em: {REPORT_PATH}")
+    except Exception as e:
+        print(f"\n[AVISO] Não foi possível salvar o relatório em JSON: {e}")
+
+
 def main():
     try:
         objective_multiplier, param_definitions = setup_parameters()
@@ -237,7 +271,7 @@ def main():
     print(f"Iniciando Otimização - Multi-Start Pattern Search")
     print(f"Estratégia: {WORKER_COUNT} buscas locais paralelas")
     print(f"Início: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
-    print(f"Término: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
+    print(f"Término previsto: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
     print("="*60)
     
     # Criar pontos de partida
@@ -249,8 +283,6 @@ def main():
     for i, point in enumerate(starting_points):
         print(f"  Worker {i+1}: {point}")
     
-    # ### ALTERAÇÃO AQUI ###
-    # Configura o Manager e a Queue para comunicação
     manager = Manager()
     results_queue = manager.Queue()
     
@@ -259,56 +291,60 @@ def main():
     global_best_individual = starting_points[0]
     
     print("\nOtimizando... (Monitorando resultados em tempo real)")
-    
-    # Inicia o Pool de Processos
-    with Pool(processes=WORKER_COUNT) as pool:
-        
-        # Lança todos os 8 workers de forma assíncrona
-        async_results = []
-        for point in starting_points:
-            res = pool.apply_async(run_pattern_search, 
-                                   args=(point, 
-                                         param_definitions, 
-                                         end_time, 
-                                         objective_multiplier, 
-                                         results_queue))
-            async_results.append(res)
 
-        # Loop de monitoramento (executa no processo principal)
-        while time.time() < end_time:
-            # Verifica se há novos resultados na fila
-            while not results_queue.empty():
-                try:
-                    worker_fitness, worker_individual = results_queue.get_nowait()
-                    
-                    # Compara com o melhor global
-                    if worker_fitness > global_best_fitness:
-                        global_best_fitness = worker_fitness
-                        global_best_individual = worker_individual
-                        
-                        # Imprime o valor real (desfazendo o multiplicador)
-                        real_value = global_best_fitness * objective_multiplier
-                        
-                        print("\n*** NOVO MELHOR ENCONTRADO ***")
-                        print(f"    -> Valor: {real_value:.4f}")
-                        print(f"    -> Input: {global_best_individual}\n")
-                        
-                except Exception:
-                    # Ignora se a fila estiver vazia (condição de corrida)
-                    pass
+    try:
+        with Pool(processes=WORKER_COUNT) as pool:
             
-            # Pausa para não consumir 100% da CPU do processo principal
-            time.sleep(0.2) 
+            async_results = []
+            for point in starting_points:
+                res = pool.apply_async(
+                    run_pattern_search, 
+                    args=(point, 
+                          param_definitions, 
+                          end_time, 
+                          objective_multiplier, 
+                          results_queue)
+                )
+                async_results.append(res)
 
-        print("Tempo esgotado. Encerrando workers...")
-        pool.terminate() # Força o encerramento dos workers
-        pool.join()
-        
-    # ### FIM DAS ALTERAÇÕES ###
-        
-    run_duration = time.time() - start_time
+            # Loop de monitoramento
+            while time.time() < end_time:
+                while not results_queue.empty():
+                    try:
+                        worker_fitness, worker_individual = results_queue.get_nowait()
+                        
+                        if worker_fitness > global_best_fitness:
+                            global_best_fitness = worker_fitness
+                            global_best_individual = worker_individual
+                            
+                            real_value = global_best_fitness * objective_multiplier
+                            
+                            print("\n*** NOVO MELHOR ENCONTRADO ***")
+                            print(f"    -> Valor: {real_value:.4f}")
+                            print(f"    -> Input: {global_best_individual}\n")
+                            
+                    except Exception:
+                        pass
+                
+                time.sleep(0.2)
+
+            print("Tempo esgotado. Encerrando workers...")
+            pool.terminate()
+            pool.join()
+
+    except KeyboardInterrupt:
+        # Se o usuário apertar CTRL+C no meio da otimização
+        print("\nExecução interrompida pelo usuário. Encerrando workers...")
+        try:
+            pool.terminate()
+            pool.join()
+        except:
+            pass
+
+    # Momento real do fim (pode ser por tempo ou CTRL+C)
+    real_end_time = time.time()
+    run_duration = real_end_time - start_time
     
-    # O valor final é o último melhor que o monitor encontrou
     best_overall_fitness = global_best_fitness * objective_multiplier
     best_overall_individual = global_best_individual
     
@@ -326,10 +362,13 @@ def main():
     print(f"Sequência do Resultado: {best_overall_individual}")
     print("="*60)
 
-if __name__ == "__main__":
-    detected_cpus = cpu_count()
-    print(f"(Detectado {detected_cpus} processadores lógicos. Usando {WORKER_COUNT}.)")
-    if WORKER_COUNT > detected_cpus:
-        print(f"AVISO: Você pediu {WORKER_COUNT} processos, mas só {detected_cpus} foram detectados.")
-    
-    main()
+    # >>> AQUI GERAMOS O ARQUIVO JSON <<<
+    save_report(
+        start_time=start_time,
+        end_time=real_end_time,
+        objective_multiplier=objective_multiplier,
+        best_value=best_overall_fitness,
+        best_individual=best_overall_individual,
+        algorithm_name="Multi-Start Pattern Search"
+    )
+
