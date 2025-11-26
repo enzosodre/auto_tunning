@@ -9,12 +9,12 @@ import copy
 # =============================================================================
 # ### CONFIGURAÇÃO PRINCIPAL (HARD-CODED) ###
 # =============================================================================
-# Edite o caminho do executável aqui
-EXECUTABLE_PATH = "./modelo10.exe"
+# Edite o caminho do executável aqui (relativo ao diretório deste script)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+EXECUTABLE_PATH = os.path.join(SCRIPT_DIR, "simulado.exe")
 
 # Tempo limite total em minutos
 TIME_LIMIT_MINUTES = 10
-
 # Número de processos paralelos (Multi-Start)
 WORKER_COUNT = 8
 
@@ -100,14 +100,14 @@ def setup_parameters():
 # ### FUNÇÃO 2: AVALIAÇÃO (BLACK-BOX) ###
 # =============================================================================
 # (Definida no topo para que os workers do pool possam acessá-la)
-def evaluate(params, objective_multiplier):
+def evaluate(params, objective_multiplier, eval_counter=None):
     """
     Executa o modelo externo e retorna seu valor de saída,
     já multiplicado pelo objetivo (para sempre maximizar).
     """
     str_params = [str(p) for p in params]
     command = [EXECUTABLE_PATH] + str_params
-    
+
     try:
         result = subprocess.run(
             command,
@@ -116,21 +116,41 @@ def evaluate(params, objective_multiplier):
             check=True,
             timeout=30
         )
-        
+
         output_str = result.stdout.strip()
-        
+
         if ':' in output_str:
             value_part = output_str.split(':')[-1]
             output_value = float(value_part.strip())
         else:
-            output_value = float(output_str) 
-            
+            output_value = float(output_str)
+
+        # Incrementa o contador de execuções (sem lock - Manager().Value é thread-safe)
+        if eval_counter is not None:
+            eval_counter.value += 1
+
         return output_value * objective_multiplier
-    
+
+    except subprocess.TimeoutExpired:
+        print(f"AVISO: Timeout ao avaliar {params} (>30s)", file=sys.stderr)
+        if eval_counter is not None:
+            eval_counter.value += 1
+        return -float('inf')
+
+    except FileNotFoundError:
+        print(f"ERRO: Executável não encontrado em '{EXECUTABLE_PATH}'", file=sys.stderr)
+        print(f"Diretório atual: {os.getcwd()}", file=sys.stderr)
+        if eval_counter is not None:
+            eval_counter.value += 1
+        return -float('inf')
+
     except Exception as e:
-        # Silencia a maioria dos erros para não poluir o console,
-        # mas você pode descomentar a linha abaixo se precisar debugar.
-        # print(f"AVISO: Falha ao avaliar {params}. Erro: {e}", file=sys.stderr)
+        print(f"AVISO: Falha ao avaliar {params}. Erro: {type(e).__name__}: {e}", file=sys.stderr)
+
+        # Incrementa o contador mesmo em caso de falha
+        if eval_counter is not None:
+            eval_counter.value += 1
+
         return -float('inf')
 
 # =============================================================================
@@ -185,17 +205,77 @@ def mutate(individual, param_definitions, mutation_rate=0.1):
 
     return mutated
 
+def local_search_refinement(individual, param_definitions, objective_multiplier, eval_counter, max_iterations=5):
+    """
+    Aplica busca local (Pattern Search simplificado) em um indivíduo.
+    Usado dentro do algoritmo memético para refinar soluções promissoras.
+    """
+    current = copy.deepcopy(individual)
+    current_fitness = evaluate(current, objective_multiplier, eval_counter)
+
+    for iteration in range(max_iterations):
+        improved = False
+
+        for i in range(len(param_definitions)):
+            p_def = param_definitions[i]
+
+            if p_def['type'] == 'cat':
+                # Testa outras opções categóricas
+                for option in p_def['options']:
+                    if option == current[i]:
+                        continue
+
+                    neighbor = copy.deepcopy(current)
+                    neighbor[i] = option
+                    neighbor_fitness = evaluate(neighbor, objective_multiplier, eval_counter)
+
+                    if neighbor_fitness > current_fitness:
+                        current = neighbor
+                        current_fitness = neighbor_fitness
+                        improved = True
+                        break
+
+            elif p_def['type'] == 'int':
+                # Testa pequenas variações
+                step = max(1, (p_def['max'] - p_def['min']) // 20)
+
+                for direction in [1, -1]:
+                    neighbor = copy.deepcopy(current)
+                    new_val = current[i] + (direction * step)
+                    new_val = max(p_def['min'], min(p_def['max'], int(new_val)))
+
+                    if new_val == current[i]:
+                        continue
+
+                    neighbor[i] = new_val
+                    neighbor_fitness = evaluate(neighbor, objective_multiplier, eval_counter)
+
+                    if neighbor_fitness > current_fitness:
+                        current = neighbor
+                        current_fitness = neighbor_fitness
+                        improved = True
+                        break
+
+            if improved:
+                break
+
+        # Se não melhorou em nenhum eixo, termina
+        if not improved:
+            break
+
+    return current, current_fitness
+
 # =============================================================================
 # ### FUNÇÃO 4: O ALGORITMO (PATTERN SEARCH) - ATUALIZADO ###
 # =============================================================================
-def run_pattern_search(start_individual, param_definitions, end_time, objective_multiplier, results_queue):
+def run_pattern_search(start_individual, param_definitions, end_time, objective_multiplier, results_queue, eval_counter=None):
     """
     Executa um Pattern Search local e reporta melhorias para a 'results_queue'.
     """
-    
+
     current_best_individual = copy.deepcopy(start_individual)
     # Avalia o ponto inicial
-    current_best_fitness = evaluate(current_best_individual, objective_multiplier)
+    current_best_fitness = evaluate(current_best_individual, objective_multiplier, eval_counter)
     
     # Reporta o ponto inicial para o monitor
     if current_best_fitness > -float('inf'):
@@ -220,27 +300,27 @@ def run_pattern_search(start_individual, param_definitions, end_time, objective_
                 if p_def['type'] == 'cat':
                     for new_option in p_def['options']:
                         if new_option == current_best_individual[i]: continue
-                        
+
                         neighbor = copy.deepcopy(current_best_individual)
                         neighbor[i] = new_option
-                        neighbor_fitness = evaluate(neighbor, objective_multiplier)
-                        
+                        neighbor_fitness = evaluate(neighbor, objective_multiplier, eval_counter)
+
                         if neighbor_fitness > best_fitness_in_axis:
                             best_fitness_in_axis = neighbor_fitness
                             best_neighbor_in_axis = neighbor
-                        
+
                         if time.time() > end_time: break
-                
+
                 elif p_def['type'] == 'int':
                     for direction in [1, -1]:
                         neighbor = copy.deepcopy(current_best_individual)
                         new_val = neighbor[i] + (direction * step_size)
                         new_val = max(p_def['min'], min(p_def['max'], int(new_val)))
-                        
+
                         if new_val == neighbor[i]: continue
-                            
+
                         neighbor[i] = new_val
-                        neighbor_fitness = evaluate(neighbor, objective_multiplier)
+                        neighbor_fitness = evaluate(neighbor, objective_multiplier, eval_counter)
                         
                         if neighbor_fitness > best_fitness_in_axis:
                             best_fitness_in_axis = neighbor_fitness
@@ -268,7 +348,7 @@ def run_pattern_search(start_individual, param_definitions, end_time, objective_
 # ### FUNÇÃO 5: ALGORITMO GENÉTICO ###
 # =============================================================================
 def run_genetic_algorithm(param_definitions, end_time, objective_multiplier, results_queue,
-                          population_size=50, mutation_rate=0.1, elitism_count=2):
+                          population_size=50, mutation_rate=0.1, elitism_count=2, eval_counter=None):
     """
     Executa um Algoritmo Genético e reporta melhorias para a 'results_queue'.
 
@@ -282,7 +362,7 @@ def run_genetic_algorithm(param_definitions, end_time, objective_multiplier, res
     population = [generate_random_individual(param_definitions) for _ in range(population_size)]
 
     # Avalia população inicial
-    fitnesses = [evaluate(ind, objective_multiplier) for ind in population]
+    fitnesses = [evaluate(ind, objective_multiplier, eval_counter) for ind in population]
 
     # Encontra melhor da população inicial
     best_idx = fitnesses.index(max(fitnesses))
@@ -326,7 +406,7 @@ def run_genetic_algorithm(param_definitions, end_time, objective_multiplier, res
         population = new_population
 
         # Avalia nova população
-        fitnesses = [evaluate(ind, objective_multiplier) for ind in population]
+        fitnesses = [evaluate(ind, objective_multiplier, eval_counter) for ind in population]
 
         # Verifica se encontrou novo melhor
         current_best_idx = fitnesses.index(max(fitnesses))
@@ -346,7 +426,7 @@ def run_genetic_algorithm(param_definitions, end_time, objective_multiplier, res
 # ### FUNÇÃO 6: ESTRATÉGIA HÍBRIDA (GA + PS) ###
 # =============================================================================
 def run_hybrid_algorithm(param_definitions, end_time, objective_multiplier, results_queue,
-                         ga_time_ratio=0.6, population_size=50, mutation_rate=0.1):
+                         ga_time_ratio=0.6, population_size=50, mutation_rate=0.1, eval_counter=None):
     """
     Executa uma estratégia híbrida: Algoritmo Genético seguido de Pattern Search.
 
@@ -369,7 +449,7 @@ def run_hybrid_algorithm(param_definitions, end_time, objective_multiplier, resu
 
     # Inicializa população aleatória
     population = [generate_random_individual(param_definitions) for _ in range(population_size)]
-    fitnesses = [evaluate(ind, objective_multiplier) for ind in population]
+    fitnesses = [evaluate(ind, objective_multiplier, eval_counter) for ind in population]
 
     # Encontra melhor inicial
     best_idx = fitnesses.index(max(fitnesses))
@@ -399,7 +479,7 @@ def run_hybrid_algorithm(param_definitions, end_time, objective_multiplier, resu
             new_population.append(child)
 
         population = new_population
-        fitnesses = [evaluate(ind, objective_multiplier) for ind in population]
+        fitnesses = [evaluate(ind, objective_multiplier, eval_counter) for ind in population]
 
         current_best_idx = fitnesses.index(max(fitnesses))
         current_best_fitness = fitnesses[current_best_idx]
@@ -424,7 +504,7 @@ def run_hybrid_algorithm(param_definitions, end_time, objective_multiplier, resu
             break
 
         current_best_individual = copy.deepcopy(start_individual)
-        current_best_fitness = evaluate(current_best_individual, objective_multiplier)
+        current_best_fitness = evaluate(current_best_individual, objective_multiplier, eval_counter)
 
         int_ranges = [p['max'] - p['min'] for p in param_definitions if p['type'] == 'int']
         step_size = max(1, int(max(int_ranges) * 0.2) if int_ranges else 20)
@@ -450,7 +530,7 @@ def run_hybrid_algorithm(param_definitions, end_time, objective_multiplier, resu
 
                             neighbor = copy.deepcopy(current_best_individual)
                             neighbor[i] = new_option
-                            neighbor_fitness = evaluate(neighbor, objective_multiplier)
+                            neighbor_fitness = evaluate(neighbor, objective_multiplier, eval_counter)
 
                             if neighbor_fitness > best_fitness_in_axis:
                                 best_fitness_in_axis = neighbor_fitness
@@ -469,7 +549,7 @@ def run_hybrid_algorithm(param_definitions, end_time, objective_multiplier, resu
                                 continue
 
                             neighbor[i] = new_val
-                            neighbor_fitness = evaluate(neighbor, objective_multiplier)
+                            neighbor_fitness = evaluate(neighbor, objective_multiplier, eval_counter)
 
                             if neighbor_fitness > best_fitness_in_axis:
                                 best_fitness_in_axis = neighbor_fitness
@@ -490,6 +570,135 @@ def run_hybrid_algorithm(param_definitions, end_time, objective_multiplier, resu
         if current_best_fitness > best_fitness:
             best_fitness = current_best_fitness
             best_individual = copy.deepcopy(current_best_individual)
+
+    return (best_fitness, best_individual)
+
+# =============================================================================
+# ### FUNÇÃO 7: ALGORITMO MEMÉTICO (HÍBRIDO VERDADEIRO) ###
+# =============================================================================
+def run_memetic_algorithm(param_definitions, end_time, objective_multiplier, results_queue,
+                          population_size=50, mutation_rate=0.15, elitism_count=2,
+                          local_search_frequency=1, local_search_top_n=5, eval_counter=None):
+    """
+    Algoritmo Memético: Integração verdadeira de GA + Busca Local.
+
+    Em cada geração:
+    1. Evolução genética (seleção, crossover, mutação)
+    2. Refinamento local (Pattern Search) nos melhores indivíduos
+    3. Substituição dos indivíduos refinados na população
+
+    Esta é uma abordagem GENUINAMENTE HÍBRIDA onde GA e PS trabalham juntos
+    sinergicamente, não sequencialmente.
+
+    Parâmetros:
+    - population_size: Tamanho da população
+    - mutation_rate: Taxa de mutação (aumentada para 15% para mais diversidade)
+    - elitism_count: Número de melhores preservados
+    - local_search_frequency: A cada quantas gerações aplicar busca local (1 = sempre)
+    - local_search_top_n: Quantos melhores indivíduos refinar localmente
+    """
+
+    # Inicializa população aleatória
+    population = [generate_random_individual(param_definitions) for _ in range(population_size)]
+    fitnesses = [evaluate(ind, objective_multiplier, eval_counter) for ind in population]
+
+    # Encontra melhor inicial
+    best_idx = fitnesses.index(max(fitnesses))
+    best_fitness = fitnesses[best_idx]
+    best_individual = copy.deepcopy(population[best_idx])
+
+    if best_fitness > -float('inf'):
+        results_queue.put((best_fitness, best_individual))
+
+    generation = 0
+
+    # Loop evolutivo com refinamento local integrado
+    while time.time() < end_time:
+        generation += 1
+
+        # =================================================================
+        # FASE 1: EVOLUÇÃO GENÉTICA (Exploração Global)
+        # =================================================================
+
+        # Ordena população por fitness
+        sorted_indices = sorted(range(len(fitnesses)), key=lambda i: fitnesses[i], reverse=True)
+
+        # Elitismo: preserva os melhores
+        new_population = [copy.deepcopy(population[i]) for i in sorted_indices[:elitism_count]]
+
+        # Gera novos indivíduos através de evolução
+        while len(new_population) < population_size:
+            if time.time() > end_time:
+                break
+
+            # Seleção de pais por torneio
+            parent1 = tournament_selection(population, fitnesses)
+            parent2 = tournament_selection(population, fitnesses)
+
+            # Crossover
+            child = crossover(parent1, parent2, param_definitions)
+
+            # Mutação
+            child = mutate(child, param_definitions, mutation_rate)
+
+            new_population.append(child)
+
+        population = new_population
+
+        # =================================================================
+        # FASE 2: REFINAMENTO LOCAL (Intensificação)
+        # =================================================================
+
+        # Aplica busca local nos melhores indivíduos a cada N gerações
+        if generation % local_search_frequency == 0:
+            # Avalia a população atual
+            fitnesses = [evaluate(ind, objective_multiplier, eval_counter) for ind in population]
+
+            # Identifica os top N indivíduos para refinar
+            sorted_indices = sorted(range(len(fitnesses)), key=lambda i: fitnesses[i], reverse=True)
+            top_indices = sorted_indices[:local_search_top_n]
+
+            # Refina cada um dos top indivíduos com busca local
+            for idx in top_indices:
+                if time.time() > end_time:
+                    break
+
+                # Aplica busca local (Pattern Search rápido)
+                refined_individual, refined_fitness = local_search_refinement(
+                    population[idx],
+                    param_definitions,
+                    objective_multiplier,
+                    eval_counter,
+                    max_iterations=3  # Busca local rápida
+                )
+
+                # Substitui o indivíduo original pelo refinado (se melhorou)
+                if refined_fitness > fitnesses[idx]:
+                    population[idx] = refined_individual
+                    fitnesses[idx] = refined_fitness
+
+                    # Atualiza melhor global se necessário
+                    if refined_fitness > best_fitness:
+                        best_fitness = refined_fitness
+                        best_individual = copy.deepcopy(refined_individual)
+                        results_queue.put((best_fitness, best_individual))
+
+        else:
+            # Se não aplicou busca local, precisa avaliar a população
+            fitnesses = [evaluate(ind, objective_multiplier, eval_counter) for ind in population]
+
+        # =================================================================
+        # ATUALIZAÇÃO DO MELHOR GLOBAL
+        # =================================================================
+
+        current_best_idx = fitnesses.index(max(fitnesses))
+        current_best_fitness = fitnesses[current_best_idx]
+        current_best_individual = population[current_best_idx]
+
+        if current_best_fitness > best_fitness:
+            best_fitness = current_best_fitness
+            best_individual = copy.deepcopy(current_best_individual)
+            results_queue.put((best_fitness, best_individual))
 
     return (best_fitness, best_individual)
 
@@ -516,7 +725,7 @@ def main():
     elif algorithm == 'ga':
         algorithm_name = "Algoritmo Genético"
     else:  # hybrid
-        algorithm_name = "Estratégia Híbrida (GA + PS)"
+        algorithm_name = "Algoritmo Memético (Híbrido Verdadeiro)"
 
     print(f"Iniciando Otimização - {algorithm_name}")
     if algorithm == 'ps':
@@ -524,22 +733,33 @@ def main():
     elif algorithm == 'ga':
         print(f"Estratégia: {WORKER_COUNT} populações evolutivas paralelas")
     else:  # hybrid
-        print(f"Estratégia: {WORKER_COUNT} execuções híbridas paralelas")
-        print(f"  Fase 1 (60% do tempo): Algoritmo Genético (exploração global)")
-        print(f"  Fase 2 (40% do tempo): Pattern Search (refinamento local)")
+        print(f"Estratégia: {WORKER_COUNT} populações meméticas paralelas")
+        print(f"  Integração GA + PS: Em CADA geração:")
+        print(f"    1. Evolução genética (exploração global)")
+        print(f"    2. Refinamento local nos top 5 indivíduos (intensificação)")
+        print(f"  População: 50 | Mutação: 15% | Refinamento: A cada geração")
     print(f"Início: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
     print(f"Término: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
     print("="*60)
-    
+
     # Configura o Manager e a Queue para comunicação
     manager = Manager()
     results_queue = manager.Queue()
+    eval_counter = manager.Value('i', 0)  # Contador compartilhado de avaliações
 
     # Variáveis para acompanhar o melhor global
     global_best_fitness = -float('inf')
     global_best_individual = None
 
     print("\nOtimizando... (Monitorando resultados em tempo real)")
+    print(f"Diretório de trabalho: {os.getcwd()}")
+    print(f"Verificando executável em: {EXECUTABLE_PATH}")
+
+    # Verifica se o executável existe antes de começar
+    if not os.path.exists(EXECUTABLE_PATH):
+        print(f"\n⚠️  AVISO: Executável não encontrado em '{EXECUTABLE_PATH}'")
+        print("O algoritmo será executado, mas todas as avaliações falharão.")
+        input("Pressione Enter para continuar mesmo assim, ou Ctrl+C para cancelar...")
 
     # Inicia o Pool de Processos
     with Pool(processes=WORKER_COUNT) as pool:
@@ -553,11 +773,12 @@ def main():
             for _ in range(WORKER_COUNT):
                 starting_points.append(generate_random_individual(param_definitions))
 
-            print(f"Iniciando {WORKER_COUNT} buscas paralelas com os seguintes pontos aleatórios:")
+            print(f"\nIniciando {WORKER_COUNT} buscas paralelas com os seguintes pontos aleatórios:")
             for i, point in enumerate(starting_points):
                 print(f"  Worker {i+1}: {point}")
 
             global_best_individual = starting_points[0]
+            print(f"\nWorkers iniciados. Aguardando primeiros resultados...")
 
             for point in starting_points:
                 res = pool.apply_async(run_pattern_search,
@@ -565,44 +786,60 @@ def main():
                                              param_definitions,
                                              end_time,
                                              objective_multiplier,
-                                             results_queue))
+                                             results_queue,
+                                             eval_counter))
                 async_results.append(res)
 
         elif algorithm == 'ga':
             # Algoritmo Genético: lança múltiplas populações
-            print(f"Iniciando {WORKER_COUNT} populações evolutivas paralelas")
+            print(f"\nIniciando {WORKER_COUNT} populações evolutivas paralelas")
             print(f"  Tamanho da população: 50 indivíduos cada")
             print(f"  Taxa de mutação: 10%")
             print(f"  Elitismo: 2 melhores preservados por geração")
 
             global_best_individual = generate_random_individual(param_definitions)
+            print(f"\nWorkers iniciados. Aguardando primeiros resultados...")
 
             for _ in range(WORKER_COUNT):
                 res = pool.apply_async(run_genetic_algorithm,
                                        args=(param_definitions,
                                              end_time,
                                              objective_multiplier,
-                                             results_queue))
+                                             results_queue,
+                                             50,  # population_size
+                                             0.1,  # mutation_rate
+                                             2,  # elitism_count
+                                             eval_counter))
                 async_results.append(res)
 
         else:  # algorithm == 'hybrid'
-            # Estratégia Híbrida: GA seguido de PS
-            print(f"Iniciando {WORKER_COUNT} execuções híbridas paralelas")
-            print(f"  População GA: 50 indivíduos")
-            print(f"  Mutação GA: 10%")
-            print(f"  Top 3 melhores do GA serão refinados com PS")
+            # Algoritmo Memético: Integração verdadeira de GA + PS
+            print(f"\nIniciando {WORKER_COUNT} populações meméticas paralelas")
+            print(f"  População: 50 indivíduos | Mutação: 15% | Elitismo: 2")
+            print(f"  Refinamento local: Top 5 indivíduos a cada geração")
+            print(f"  Estratégia: Evolução + Intensificação em CADA geração")
 
             global_best_individual = generate_random_individual(param_definitions)
+            print(f"\nWorkers iniciados. Aguardando primeiros resultados...")
 
             for _ in range(WORKER_COUNT):
-                res = pool.apply_async(run_hybrid_algorithm,
+                res = pool.apply_async(run_memetic_algorithm,
                                        args=(param_definitions,
                                              end_time,
                                              objective_multiplier,
-                                             results_queue))
+                                             results_queue,
+                                             50,   # population_size
+                                             0.15, # mutation_rate (15%)
+                                             2,    # elitism_count
+                                             1,    # local_search_frequency (toda geração)
+                                             5,    # local_search_top_n (top 5)
+                                             eval_counter))
                 async_results.append(res)
 
         # Loop de monitoramento (executa no processo principal)
+        last_status_time = time.time()
+        status_interval = 30  # Mostra status a cada 30 segundos
+
         try:
             while time.time() < end_time:
                 # Verifica se há novos resultados na fila
@@ -617,14 +854,28 @@ def main():
 
                             # Imprime o valor real (desfazendo o multiplicador)
                             real_value = global_best_fitness * objective_multiplier
+                            elapsed = time.time() - start_time
 
-                            print("\n*** NOVO MELHOR ENCONTRADO ***")
-                            print(f"    -> Valor: {real_value:.4f}")
-                            print(f"    -> Input: {global_best_individual}\n")
+                            print("\n" + "="*60)
+                            print("*** NOVO MELHOR ENCONTRADO ***")
+                            print(f"Tempo decorrido: {elapsed/60:.2f} minutos")
+                            print(f"Execuções realizadas: {eval_counter.value}")
+                            print(f"Valor encontrado: {real_value:.4f}")
+                            print(f"Parâmetros: {global_best_individual}")
+                            print("="*60 + "\n")
 
                     except Exception:
                         # Ignora se a fila estiver vazia (condição de corrida)
                         pass
+
+                # Mostra status periódico
+                current_time = time.time()
+                if current_time - last_status_time >= status_interval:
+                    elapsed = current_time - start_time
+                    remaining = end_time - current_time
+                    print(f"\n[Status] Tempo: {elapsed/60:.1f}m | Execuções: {eval_counter.value} | "
+                          f"Restante: {remaining/60:.1f}m | Melhor: {global_best_fitness * objective_multiplier:.4f}")
+                    last_status_time = current_time
 
                 # Pausa para não consumir 100% da CPU do processo principal
                 time.sleep(0.2)
@@ -650,15 +901,19 @@ def main():
     print("\n" + "="*60)
     print("OTIMIZAÇÃO CONCLUÍDA")
     print("="*60)
-    
+
     print("\n" + "="*60)
     print("RELATÓRIO FINAL DA ESTRATÉGIA")
     print("="*60)
-    print(f"Estratégia Utilizada: {algorithm_name} ({WORKER_COUNT} execuções paralelas)")
-    print(f"Tempo Total de Execução: {run_duration / 60:.2f} minutos")
+    print(f"Estratégia Utilizada: {algorithm_name}")
+    print(f"Número de Workers Paralelos: {WORKER_COUNT}")
+    print(f"Tempo Total de Execução: {run_duration / 60:.2f} minutos ({run_duration:.2f} segundos)")
+    print(f"Total de Execuções do Modelo: {eval_counter.value}")
+    if run_duration > 0:
+        print(f"Taxa de Execução: {eval_counter.value / run_duration:.2f} avaliações/segundo")
     print("\n--- MELHOR RESULTADO ENCONTRADO ---")
     print(f"Melhor Valor Alcançado: {best_overall_fitness:.4f}")
-    print(f"Sequência do Resultado: {best_overall_individual}")
+    print(f"Sequência de Parâmetros: {best_overall_individual}")
     print("="*60)
 
 if __name__ == "__main__":
